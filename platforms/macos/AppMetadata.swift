@@ -30,6 +30,11 @@ enum AppMetadata {
     static let authorLinkedin = "https://www.linkedin.com/in/khaphanspace"
     static let voteURL = "https://unikorn.vn/p/gonhanh?ref=gonhanh"
 
+    /// GitHub repo ("owner/name") whose releases the auto-updater installs from.
+    /// Points at our fork so upstream releases never replace fork builds. While the
+    /// fork publishes no releases, the updater always reports "up to date".
+    static let updateRepository = "thienanblog/gonhanh.org"
+
     // Legal
     static let copyright = "Copyright © 2025 \(author). All rights reserved."
     static let license = "GPL-3.0-or-later"

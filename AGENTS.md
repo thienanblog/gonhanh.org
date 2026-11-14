@@ -56,7 +56,7 @@ The engine is a pure function of key codes plus settings. If output is wrong for
 | `AppMetadata.swift` | `AppMetadata`, `SettingsKey` (UserDefaults keys `gonhanh.*`), `InputMode` (0 Telex, 1 VNI) |
 | `MenuBar.swift`, `OnboardingView.swift` | Status item, onboarding / Accessibility permission flow |
 | `SpecialPanelAppDetector.swift`, `InputSourceManager.swift` | Spotlight/Raycast panels; auto-disable for non-Latin input sources |
-| `UpdateChecker.swift`, `UpdateManager.swift` | Hourly background update check against **upstream** releases (`khaphanspace/gonhanh.org`, URL in `UpdateChecker.githubAPIURL`). A newer upstream version is downloaded silently and offered as a restart-to-update in the menu. Accepting it installs the upstream app over a locally built fork app and drops every fork-only change. Repoint or disable this before shipping fork builds. |
+| `UpdateChecker.swift`, `UpdateManager.swift` | Hourly background update check against the releases of `AppMetadata.updateRepository` (our fork, `thienanblog/gonhanh.org`). A newer version is downloaded silently and offered as a restart-to-update in the menu; it installs the first `.dmg` asset of the highest non-draft release (pre-releases only for `*pre*` builds). The fork has no releases yet, so the updater reports "up to date". Never point it back at upstream: an upstream release would replace the fork build and drop every fork-only change. |
 
 Injection rules worth knowing before touching `TextInjector`:
 
