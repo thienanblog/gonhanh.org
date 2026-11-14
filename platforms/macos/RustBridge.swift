@@ -202,12 +202,25 @@ private class TextInjector {
 
     private init() {}
 
+    /// Proxy to post synthetic events through, or nil to post at session level.
+    ///
+    /// When the hook is a session-level tap, events posted with `.post(tap: .cgSessionEventTap)`
+    /// enter the same queue as the user's real keystrokes, which wait at our tap while the
+    /// callback is still injecting. A key typed mid-injection then lands between the injected
+    /// backspaces and the replacement text ("cái nút" became "c áinút"). Posting through the
+    /// proxy inserts events right after our tap, ahead of keystrokes still waiting to reach it.
+    /// HID-level taps hold real keys upstream until the callback returns, so they keep the
+    /// session post they were tuned with.
+    private func sessionProxy(_ proxy: CGEventTapProxy) -> CGEventTapProxy? {
+        KeyboardHookManager.shared.isSessionTap ? proxy : nil
+    }
+
     /// Post break key (Enter, punctuation) synthetically after text injection
     /// Used for auto-restore to ensure correct event ordering
-    func postBreakKey(keyCode: CGKeyCode, shift: Bool) {
+    func postBreakKey(keyCode: CGKeyCode, shift: Bool, proxy: CGEventTapProxy) {
         guard let src = CGEventSource(stateID: .privateState) else { return }
         let flags: CGEventFlags = shift ? .maskShift : []
-        postKey(keyCode, source: src, flags: flags)
+        postKey(keyCode, source: src, flags: flags, proxy: sessionProxy(proxy))
     }
 
     /// Inject text replacement synchronously (blocks until complete)
@@ -215,17 +228,19 @@ private class TextInjector {
         semaphore.wait()
         defer { semaphore.signal() }
 
+        let postProxy = sessionProxy(proxy)
+
         switch method {
         case .selection:
-            injectViaSelection(bs: bs, text: text, delays: delays)
+            injectViaSelection(bs: bs, text: text, delays: delays, proxy: postProxy)
         case .axDirect:
             injectViaAXWithFallback(bs: bs, text: text, proxy: proxy)
         case .emptyCharPrefix:
-            injectViaBackspace(bs: bs, text: text, delays: delays, emptyCharPrefix: true)
+            injectViaBackspace(bs: bs, text: text, delays: delays, proxy: postProxy, emptyCharPrefix: true)
         case .charByChar:
-            injectViaBackspace(bs: bs, text: text, delays: delays, charByChar: true)
+            injectViaBackspace(bs: bs, text: text, delays: delays, proxy: postProxy, charByChar: true)
         case .slow, .fast:
-            injectViaBackspace(bs: bs, text: text, delays: delays)
+            injectViaBackspace(bs: bs, text: text, delays: delays, proxy: postProxy)
         case .syncProxy:
             injectViaProxy(bs: bs, text: text, proxy: proxy)
         case .passthrough:
@@ -242,7 +257,7 @@ private class TextInjector {
     /// Standard backspace injection: delete N chars, then type replacement
     /// - charByChar: character-by-character mode (slower but more reliable for Safari Google Docs)
     /// - emptyCharPrefix: send empty char (U+202F) first to break autocomplete highlight (for browser address bars)
-    private func injectViaBackspace(bs: Int, text: String, delays: (UInt32, UInt32, UInt32), charByChar: Bool = false, emptyCharPrefix: Bool = false) {
+    private func injectViaBackspace(bs: Int, text: String, delays: (UInt32, UInt32, UInt32), proxy: CGEventTapProxy? = nil, charByChar: Bool = false, emptyCharPrefix: Bool = false) {
         guard let src = CGEventSource(stateID: .privateState) else {
             Log.info("inject FAILED: no event source")
             return
@@ -261,22 +276,21 @@ private class TextInjector {
                 up.setIntegerValueField(.eventSourceUserData, value: kEventMarker)
                 dn.keyboardSetUnicodeString(stringLength: 1, unicodeString: emptyChar)
                 up.keyboardSetUnicodeString(stringLength: 1, unicodeString: emptyChar)
-                dn.post(tap: .cgSessionEventTap)
-                up.post(tap: .cgSessionEventTap)
+                postPair(dn, up, proxy: proxy)
             }
             usleep(delays.0 > 0 ? delays.0 : 1000)
             bs += 1 // +1 to also delete the empty char
         }
 
         for _ in 0 ..< bs {
-            postKey(KeyCode.backspace, source: src)
+            postKey(KeyCode.backspace, source: src, proxy: proxy)
             usleep(delays.0)
         }
         if bs > 0 {
             usleep(delays.1)
         }
 
-        let chunks = postText(text, source: src, delay: delays.2, chunkSize: charByChar ? 1 : 20)
+        let chunks = postText(text, source: src, delay: delays.2, proxy: proxy, chunkSize: charByChar ? 1 : 20)
 
         if Log.isEnabled {
             let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
@@ -300,7 +314,7 @@ private class TextInjector {
     /// Selection injection: Shift+Left to select, then type replacement (for browser address bars)
     /// For backspace-only (text empty): use backspace to properly delete spaces/punctuation
     /// For text replacement: use Shift+Left to select (normal behavior)
-    private func injectViaSelection(bs: Int, text: String, delays: (UInt32, UInt32, UInt32)) {
+    private func injectViaSelection(bs: Int, text: String, delays: (UInt32, UInt32, UInt32), proxy: CGEventTapProxy? = nil) {
         guard let src = CGEventSource(stateID: .privateState) else { return }
 
         let selDelay = delays.0 > 0 ? delays.0 : 1000
@@ -313,20 +327,20 @@ private class TextInjector {
             if text.isEmpty {
                 // Backspace-only: use backspace for all deletions
                 for _ in 0 ..< bs {
-                    postKey(KeyCode.backspace, source: src)
+                    postKey(KeyCode.backspace, source: src, proxy: proxy)
                     usleep(selDelay)
                 }
             } else {
                 // Text replacement: use Shift+Left to select (normal selection method)
                 for _ in 0 ..< bs {
-                    postKey(KeyCode.leftArrow, source: src, flags: .maskShift)
+                    postKey(KeyCode.leftArrow, source: src, flags: .maskShift, proxy: proxy)
                     usleep(selDelay)
                 }
             }
             usleep(waitDelay)
         }
 
-        postText(text, source: src, delay: textDelay)
+        postText(text, source: src, delay: textDelay, proxy: proxy)
     }
 
     /// Autocomplete injection: Forward Delete to clear suggestion, then backspace + text via proxy
@@ -468,6 +482,11 @@ private class TextInjector {
             dn.flags = flags; up.flags = flags
         }
 
+        postPair(dn, up, proxy: proxy)
+    }
+
+    /// Post a key down/up pair through the tap proxy when given, else at session level
+    private func postPair(_ dn: CGEvent, _ up: CGEvent, proxy: CGEventTapProxy?) {
         if let proxy {
             dn.tapPostEvent(proxy)
             up.tapPostEvent(proxy)
@@ -531,13 +550,7 @@ private class TextInjector {
             dn.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
             up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
 
-            if let proxy {
-                dn.tapPostEvent(proxy)
-                up.tapPostEvent(proxy)
-            } else {
-                dn.post(tap: .cgSessionEventTap)
-                up.post(tap: .cgSessionEventTap)
-            }
+            postPair(dn, up, proxy: proxy)
             if delay > 0 {
                 usleep(delay)
             }
@@ -944,10 +957,16 @@ class KeyboardHookManager {
     private var watchdogTimer: Timer? // periodically re-enables a silently-disabled tap
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isRunning = false
-    private var currentTapIsSession = false // which tap level the active hook was created at
+    private var requestedSessionTap = false // tap level start() asked for (watchdog compares it to wantsSessionTap)
     private var secureInputState = SecureInputStateTracker()
 
     private init() {}
+
+    /// Whether the active hook really is a session-level tap (also true when the HID tap
+    /// could not be created and start() fell back to session level). Injection reads this
+    /// per keystroke because the watchdog switches tap levels when the Accessibility
+    /// Keyboard appears.
+    private(set) var isSessionTap = false
 
     /// Whether the keyboard hook should run at session-tap level: either the user enabled it
     /// manually, or the Accessibility Keyboard panel is up and needs its synthetic events
@@ -977,18 +996,16 @@ class KeyboardHookManager {
         // all of which inject at session level and are invisible to the default HID tap.
         // Default (HID tap): highest priority, physical keystrokes only, best for most cases.
         let useSessionTap = wantsSessionTap
-        currentTapIsSession = useSessionTap
-        let tap: CFMachPort? = if useSessionTap {
-            CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+        requestedSessionTap = useSessionTap
+        func createTap(at location: CGEventTapLocation) -> CFMachPort? {
+            CGEvent.tapCreate(tap: location, place: .headInsertEventTap,
                               options: .defaultTap, eventsOfInterest: mask,
                               callback: keyboardCallback, userInfo: nil)
-        } else {
-            CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap,
-                              options: .defaultTap, eventsOfInterest: mask,
-                              callback: keyboardCallback, userInfo: nil)
-                ?? CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                     options: .defaultTap, eventsOfInterest: mask,
-                                     callback: keyboardCallback, userInfo: nil)
+        }
+        var tap = useSessionTap ? nil : createTap(at: .cghidEventTap)
+        isSessionTap = tap == nil
+        if tap == nil {
+            tap = createTap(at: .cgSessionEventTap)
         }
 
         guard let tap else {
@@ -1024,7 +1041,7 @@ class KeyboardHookManager {
             self.refreshSecureInputState()
             // Issue #395: switch tap level when the Accessibility Keyboard panel appears or
             // disappears, so its session-level keystrokes are captured only while it is up.
-            if self.wantsSessionTap != self.currentTapIsSession {
+            if self.wantsSessionTap != self.requestedSessionTap {
                 Log.info("auto tap-mode: session=\(self.wantsSessionTap) → restart")
                 self.restart()
                 return
@@ -1146,6 +1163,7 @@ class KeyboardHookManager {
         runLoopSource = nil
         mouseMonitor = nil
         isRunning = false
+        isSessionTap = false
     }
 
     func getTap() -> CFMachPort? {
@@ -1582,7 +1600,7 @@ private func keyboardCallback(
             if bs > 0 || !chars.isEmpty {
                 // Shortcut: consumed, don't post. Auto-restore: post Enter after replacement
                 if !keyConsumed {
-                    TextInjector.shared.postBreakKey(keyCode: keyCode, shift: shift)
+                    TextInjector.shared.postBreakKey(keyCode: keyCode, shift: shift, proxy: proxy)
                 }
                 return nil
             }
@@ -1719,7 +1737,7 @@ private func keyboardCallback(
         if isBreak {
             // Auto-restore: post break key after replacement for correct ordering
             if bs > 0, !chars.isEmpty {
-                TextInjector.shared.postBreakKey(keyCode: keyCode, shift: shift)
+                TextInjector.shared.postBreakKey(keyCode: keyCode, shift: shift, proxy: proxy)
             } else {
                 return Unmanaged.passUnretained(event)
             }
