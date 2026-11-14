@@ -34,17 +34,54 @@ class UpdateManager: NSObject, ObservableObject {
     private let checkInterval: TimeInterval = 60 * 60 // 1 hour
     private let dmgKey = "gonhanh.update.dmgPath"
     private let versionKey = "gonhanh.update.pendingVersion"
+    private let sourceKey = "gonhanh.update.sourceRepository"
 
     override private init() {
         super.init()
-        // Restore pending update from previous session
-        if let path = UserDefaults.standard.string(forKey: dmgKey),
-           FileManager.default.fileExists(atPath: path)
-        {
-            let version = UserDefaults.standard.string(forKey: versionKey) ?? "?"
-            state = .readyToInstall(dmgPath: URL(fileURLWithPath: path))
-            pendingVersion = version
+        restorePendingUpdate()
+    }
+
+    /// Restore a pending update downloaded in a previous session.
+    /// Discard it unless it came from the current update repository and is newer than this
+    /// build: a DMG downloaded from another repository (upstream, before the updater was
+    /// repointed) or an already-installed version must never be offered as an update.
+    private func restorePendingUpdate() {
+        let defaults = UserDefaults.standard
+        guard let path = defaults.string(forKey: dmgKey) else { return }
+
+        let version = defaults.string(forKey: versionKey) ?? ""
+        let keep = Self.shouldKeepPendingUpdate(
+            source: defaults.string(forKey: sourceKey),
+            version: version,
+            currentVersion: AppMetadata.version,
+            updateRepository: AppMetadata.updateRepository
+        )
+
+        guard keep, FileManager.default.fileExists(atPath: path) else {
+            try? FileManager.default.removeItem(atPath: path)
+            clearPendingUpdate()
+            return
         }
+        state = .readyToInstall(dmgPath: URL(fileURLWithPath: path))
+        pendingVersion = version
+    }
+
+    /// A pending update is kept only if it was downloaded from `updateRepository` and its
+    /// version is newer than the running build.
+    static func shouldKeepPendingUpdate(source: String?, version: String, currentVersion: String, updateRepository: String) -> Bool {
+        guard source == updateRepository else { return false }
+        return currentVersion.withCString { currentPtr in
+            version.withCString { pendingPtr in
+                version_has_update(currentPtr, pendingPtr)
+            }
+        } == 1
+    }
+
+    private func clearPendingUpdate() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: dmgKey)
+        defaults.removeObject(forKey: versionKey)
+        defaults.removeObject(forKey: sourceKey)
     }
 
     /// Version string of the pending update
@@ -121,6 +158,7 @@ class UpdateManager: NSObject, ObservableObject {
 
     /// Download update (from popup CTA)
     func downloadUpdate(_ info: UpdateInfo) {
+        pendingVersion = info.version
         state = .downloading(progress: 0)
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
         downloadTask = session.downloadTask(with: info.downloadURL)
@@ -161,8 +199,7 @@ class UpdateManager: NSObject, ObservableObject {
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmpScript.path)
 
         // Clear pending update state
-        UserDefaults.standard.removeObject(forKey: dmgKey)
-        UserDefaults.standard.removeObject(forKey: versionKey)
+        clearPendingUpdate()
 
         // Launch script in background and quit
         let process = Process()
@@ -249,6 +286,7 @@ class UpdateManager: NSObject, ObservableObject {
     fileprivate func finishDownload(to destinationURL: URL) {
         UserDefaults.standard.set(destinationURL.path, forKey: dmgKey)
         UserDefaults.standard.set(pendingVersion, forKey: versionKey)
+        UserDefaults.standard.set(AppMetadata.updateRepository, forKey: sourceKey)
         state = .readyToInstall(dmgPath: destinationURL)
     }
 }

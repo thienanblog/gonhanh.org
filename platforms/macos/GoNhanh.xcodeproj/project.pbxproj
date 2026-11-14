@@ -27,6 +27,7 @@
 		B1000001000000000000001 /* KeyboardShortcutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000002000000000000001 /* KeyboardShortcutTests.swift */; };
 		B1000001000000000000002 /* LaunchAtLoginTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000002000000000000002 /* LaunchAtLoginTests.swift */; };
 		B1000001000000000000003 /* SoundManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000002000000000000003 /* SoundManagerTests.swift */; };
+		B1000001000000000000004 /* UpdateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000002000000000000004 /* UpdateTests.swift */; };
 		UPDATECHK001 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = UPDATECHK002 /* UpdateChecker.swift */; };
 /* End PBXBuildFile section */
 
@@ -64,6 +65,7 @@
 		B1000002000000000000001 /* KeyboardShortcutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcutTests.swift; sourceTree = "<group>"; };
 		B1000002000000000000002 /* LaunchAtLoginTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLoginTests.swift; sourceTree = "<group>"; };
 		B1000002000000000000003 /* SoundManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoundManagerTests.swift; sourceTree = "<group>"; };
+		B1000002000000000000004 /* UpdateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateTests.swift; sourceTree = "<group>"; };
 		B1000003000000000000002 /* GoNhanhTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GoNhanhTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -128,6 +130,7 @@
 				B1000002000000000000001 /* KeyboardShortcutTests.swift */,
 				B1000002000000000000002 /* LaunchAtLoginTests.swift */,
 				B1000002000000000000003 /* SoundManagerTests.swift */,
+				B1000002000000000000004 /* UpdateTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -261,6 +264,7 @@
 				B1000001000000000000001 /* KeyboardShortcutTests.swift in Sources */,
 				B1000001000000000000002 /* LaunchAtLoginTests.swift in Sources */,
 				B1000001000000000000003 /* SoundManagerTests.swift in Sources */,
+				B1000001000000000000004 /* UpdateTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
