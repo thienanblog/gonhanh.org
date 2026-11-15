@@ -84,14 +84,24 @@ Write engine tests with `gonhanh_core::utils::{telex, vni, telex_auto_restore, t
 macOS:
 
 ```bash
-make build      # format + core.sh + macos.sh + windows.sh, then opens the app
-make install    # build, copy to /Applications, open
+make build      # format + core.sh + macos.sh + windows.sh, then opens the build copy
+make install    # core.sh + macos.sh, then scripts/install/macos.sh: replace /Applications/GoNhanh.app and relaunch
 make lint       # clippy + swiftformat --lint (CI fails on swiftformat issues)
 ```
 
+### Installing the build on the user's Mac
+
+When a task that changes the macOS app (Swift sources or the Rust core) is merged, run `make install` from the repo root on `main` without asking. Standing instruction from the user.
+
+- It needs no sudo or password and works from non-interactive shells.
+- The installed app keeps running during the build. Typing stops only for the few seconds between quitting it and relaunching the new copy.
+- `scripts/install/macos.sh` fails if the app does not come back up. On success it prints the installed version and commit. Report that line, and tell the user to type a test word (`vieejt` → `việt`).
+- The app is signed with the local Developer ID certificate. Its designated requirement (bundle id + team id) does not change between builds, so the existing Accessibility grant keeps working. Re-granting is only needed if the build falls back to ad-hoc signing; the scripts print a warning when that happens.
+- Never write the TCC database. The system `TCC.db` is read-only while SIP is enabled, even with sudo.
+
 Known local pitfalls on this machine:
 
-- `scripts/build/core.sh` builds a universal lib and needs `rustup target add x86_64-apple-darwin`. Without it, for an arm64-only local build:
+- `scripts/build/core.sh` builds a universal lib and needs `rustup target add x86_64-apple-darwin` (installed on this machine). Without it, for an arm64-only local build:
   ```bash
   cd core && cargo build --release --target aarch64-apple-darwin
   cp target/aarch64-apple-darwin/release/libgonhanh_core.a ../platforms/macos/
@@ -100,8 +110,8 @@ Known local pitfalls on this machine:
     ARCHS=arm64 ONLY_ACTIVE_ARCH=YES
   ```
 - `libgonhanh_core.a` must exist in `platforms/macos/` (gitignored) for both the app build and `xcodebuild test`.
-- `macos.sh` kills any running `GoNhanh` and ends with a `sudo sqlite3` write to the TCC database. That step fails in non-interactive shells; do not work around it. After a rebuild with a new signature, the user re-grants Accessibility in System Settings.
-- `swiftformat` is not installed locally (`brew install swiftformat`). CI lints Swift with it.
+- `macos.sh` only stops a `GoNhanh` running from `platforms/macos/build/`; the installed copy is replaced by `scripts/install/macos.sh`.
+- `swiftformat` is not installed locally (`brew install swiftformat`). GitHub Actions do not run on the fork (PRs show no checks), so nothing enforces swiftformat. Follow the surrounding style by hand.
 - Swift tests: `cd platforms/macos && xcodebuild test -scheme GoNhanh -configuration Debug -destination 'platform=macOS,arch=arm64' CODE_SIGN_IDENTITY=-`.
 - No automated test covers macOS injection timing. Verify those changes by typing fast in a real app, in both HID and session tap modes.
 

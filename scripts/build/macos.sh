@@ -74,16 +74,17 @@ done
 if [ "$CLEAN_INSTALL" = true ]; then
     echo "Cleaning existing installation..."
 
-    # Kill running GoNhanh processes
-    if pgrep -f "GoNhanh" > /dev/null 2>&1; then
+    # Kill running GoNhanh processes. Match the process name (-x), not its arguments (-f):
+    # "-f GoNhanh" also hits Xcode or editors that have GoNhanh files open.
+    if pgrep -x "GoNhanh" > /dev/null 2>&1; then
         echo "Stopping running GoNhanh processes..."
-        pkill -f "GoNhanh" 2>/dev/null || true
+        pkill -x "GoNhanh" 2>/dev/null || true
         # Wait for process to terminate
         sleep 1
         # Force kill if still running
-        if pgrep -f "GoNhanh" > /dev/null 2>&1; then
+        if pgrep -x "GoNhanh" > /dev/null 2>&1; then
             echo "Force killing GoNhanh..."
-            pkill -9 -f "GoNhanh" 2>/dev/null || true
+            pkill -9 -x "GoNhanh" 2>/dev/null || true
             sleep 1
         fi
         echo "GoNhanh processes stopped."
@@ -117,14 +118,19 @@ if [ "$CLEAN_INSTALL" = true ]; then
     echo ""
 fi
 
-# Always kill running GoNhanh before build (even without --clean)
-if pgrep -x "GoNhanh" > /dev/null 2>&1; then
-    echo "Stopping running GoNhanh..."
-    pkill -x "GoNhanh" 2>/dev/null || true
+# Stop only a GoNhanh launched from this build directory: its bundle is about to be
+# replaced. The installed /Applications copy keeps running so typing works during the
+# build; make install swaps it in a single quick step afterwards.
+# Match only the app binary: a bare build-directory pattern would also kill Xcode,
+# editors or tails that have a path under build/ in their arguments.
+BUILD_APP_PATTERN="$(cd "$(dirname "$0")/../.." && pwd)/platforms/macos/build/.*GoNhanh\.app/Contents/MacOS/GoNhanh"
+if pgrep -f "$BUILD_APP_PATTERN" > /dev/null 2>&1; then
+    echo "Stopping GoNhanh running from the build directory..."
+    pkill -f "$BUILD_APP_PATTERN" 2>/dev/null || true
     sleep 0.5
     # Force kill if still running
-    if pgrep -x "GoNhanh" > /dev/null 2>&1; then
-        pkill -9 -x "GoNhanh" 2>/dev/null || true
+    if pgrep -f "$BUILD_APP_PATTERN" > /dev/null 2>&1; then
+        pkill -9 -f "$BUILD_APP_PATTERN" 2>/dev/null || true
         sleep 0.5
     fi
 fi
@@ -210,6 +216,8 @@ if [ -d "GoNhanh.xcodeproj" ]; then
     # Copy app from DerivedData to local build directory
     echo "Copying app to build directory..."
     mkdir -p build/Release
+    # Replace, don't merge: cp -R into an existing bundle keeps files the new build dropped.
+    rm -rf build/Release/GoNhanh.app
     cp -R "build/DerivedData/Build/Products/Release/GoNhanh.app" build/Release/
 
     # Sign app with entitlements
@@ -242,21 +250,13 @@ if [ -d "GoNhanh.xcodeproj" ]; then
     codesign -vvv --deep --strict build/Release/GoNhanh.app
     echo "Signature verified!"
 
-    # Grant Accessibility permission (update TCC database with new csreq)
-    BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" build/Release/GoNhanh.app/Contents/Info.plist)
-    TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
-    NEW_CSREQ=$(codesign -d -r- build/Release/GoNhanh.app 2>&1 | awk -F ' => ' '/designated/{print $2}' | csreq -r- -b /dev/stdout | xxd -p | tr -d '\n' | tr '[:lower:]' '[:upper:]')
-    OLD_CSREQ=$(sqlite3 "$TCC_DB" "SELECT hex(csreq) FROM access WHERE service='kTCCServiceAccessibility' AND client='$BUNDLE_ID'" 2>/dev/null || echo "")
-    if [ "$NEW_CSREQ" != "$OLD_CSREQ" ]; then
-        echo "Updating Accessibility permission..."
-        sudo sqlite3 "$TCC_DB" "
-            DELETE FROM access WHERE service='kTCCServiceAccessibility' AND client='$BUNDLE_ID';
-            INSERT INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
-            VALUES ('kTCCServiceAccessibility', '$BUNDLE_ID', 0, 2, 4, 1, X'$NEW_CSREQ', 0, 'UNUSED', 0, CAST(strftime('%s','now') AS INTEGER));
-        "
-        echo "✅ Accessibility granted"
-    else
-        echo "✅ Accessibility: already granted"
+    # Accessibility permission is not written here. The system TCC database is read-only
+    # while SIP is enabled, even with sudo, so a direct write always failed and stopped the
+    # build. It is also unnecessary for Developer ID builds: TCC matches the designated
+    # requirement (bundle id + team id), which stays the same across rebuilds, so an
+    # existing grant keeps working. Only ad-hoc builds change identity on every build.
+    if codesign -dv build/Release/GoNhanh.app 2>&1 | grep -q "Signature=adhoc"; then
+        echo "⚠️  Ad-hoc signed: re-enable GoNhanh in System Settings > Privacy & Security > Accessibility after installing."
     fi
 
     # Notarize if requested
