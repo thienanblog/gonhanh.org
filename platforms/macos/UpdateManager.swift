@@ -316,7 +316,10 @@ extension UpdateManager: URLSessionDownloadDelegate {
         }
     }
 
-    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
+    func urlSession(_ session: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
+        // Each download creates its own session, which retains its delegate (self) until it is
+        // invalidated. Release it once its only task is done so repeated checks don't leak.
+        session.finishTasksAndInvalidate()
         if let error, (error as NSError).code != NSURLErrorCancelled {
             if case .downloading = state {
                 state = .error("Tải về thất bại")

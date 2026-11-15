@@ -493,3 +493,73 @@ final class SecureInputRecoveryTests: XCTestCase {
         XCTAssertFalse(SecureInputPresentation.tooltip(holderName: nil).contains("("))
     }
 }
+
+// MARK: - Word Restore Tests
+
+/// Backspace-into-word restore picks the word from the text before the cursor.
+/// The caller cuts that text at the AX cursor offset in UTF-16, so these cases cover the
+/// inputs that used to shift a Character-indexed lookup: emoji, CRLF, decomposed letters.
+final class WordRestoreTests: XCTestCase {
+    func testRestoresVietnameseWordBeforeSingleSpace() {
+        XCTAssertEqual(WordRestore.word(beforeCursor: "xin chào ", truncated: false), "chào")
+    }
+
+    func testRestoresASCIIWordBeforePunctuation() {
+        XCTAssertEqual(WordRestore.word(beforeCursor: "hello viet,", truncated: false), "viet")
+    }
+
+    func testRestoresWordAtStartOfField() {
+        XCTAssertEqual(WordRestore.word(beforeCursor: "việt ", truncated: false), "việt")
+    }
+
+    func testNoRestoreWhenCursorIsInsideWord() {
+        XCTAssertNil(WordRestore.word(beforeCursor: "xin chào", truncated: false))
+    }
+
+    func testNoRestoreWithSeveralSeparatorsBeforeWord() {
+        XCTAssertNil(WordRestore.word(beforeCursor: "chào  ", truncated: false))
+        XCTAssertNil(WordRestore.word(beforeCursor: "chào. ", truncated: false))
+    }
+
+    func testNoRestoreForEmptyOrSeparatorOnlyText() {
+        XCTAssertNil(WordRestore.word(beforeCursor: "", truncated: false))
+        XCTAssertNil(WordRestore.word(beforeCursor: " ", truncated: false))
+    }
+
+    func testNoRestoreForNonVietnameseWord() {
+        XCTAssertNil(WordRestore.word(beforeCursor: "abc123 ", truncated: false))
+        XCTAssertNil(WordRestore.word(beforeCursor: "日本 ", truncated: false))
+    }
+
+    func testEmojiEarlierInTextDoesNotShiftWord() {
+        XCTAssertEqual(WordRestore.word(beforeCursor: "Hay quá 😀 chào ", truncated: false), "chào")
+    }
+
+    func testCRLFEarlierInTextDoesNotShiftWord() {
+        XCTAssertEqual(WordRestore.word(beforeCursor: "dòng một\r\nchào ", truncated: false), "chào")
+    }
+
+    func testTruncatedWindowRejectsWordThatMayBeCut() {
+        XCTAssertNil(WordRestore.word(beforeCursor: "ào ", truncated: true))
+        XCTAssertEqual(WordRestore.word(beforeCursor: "ab chào ", truncated: true), "chào")
+    }
+
+    /// The fallback path cuts the full field value at the AX cursor, a UTF-16 offset.
+    func testTextBeforeCursorCutsByUTF16AfterEmoji() {
+        let field = "😀 chào bạn"
+        let cursor = "😀 chào ".utf16.count // AX offset of the cursor right after "chào "
+        let prefix = WordRestore.textBeforeCursor(field, utf16Offset: cursor)
+        XCTAssertEqual(prefix, "😀 chào ")
+        XCTAssertEqual(prefix.flatMap { WordRestore.word(beforeCursor: $0, truncated: false) }, "chào")
+    }
+
+    func testTextBeforeCursorRejectsOutOfRangeOffset() {
+        XCTAssertNil(WordRestore.textBeforeCursor("chào", utf16Offset: 5))
+        XCTAssertNil(WordRestore.textBeforeCursor("chào", utf16Offset: -1))
+        XCTAssertEqual(WordRestore.textBeforeCursor("chào", utf16Offset: 0), "")
+    }
+
+    func testTextBeforeCursorRejectsSplitSurrogatePair() {
+        XCTAssertNil(WordRestore.textBeforeCursor("a😀", utf16Offset: 2))
+    }
+}
