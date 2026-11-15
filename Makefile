@@ -38,7 +38,7 @@ help:
 	@echo ""
 	@echo "\033[1;32mInstall:\033[0m"
 	@echo "  setup       Setup dev environment"
-	@echo "  install     Build + copy to /Applications"
+	@echo "  install     Build + replace /Applications app + relaunch"
 	@echo "  dmg         Create DMG installer"
 	@echo ""
 	@echo "\033[1;32mRelease:\033[0m"
@@ -122,12 +122,10 @@ perf:
 setup: ## Setup dev environment
 	@./scripts/setup/macos.sh
 
-install: build
-	@osascript -e 'tell application "System Events"' -e 'repeat with i from (count of every login item) to 1 by -1' -e 'set li to login item i' -e 'if name of li is "GoNhanh" and path of li contains "/build/" then delete login item i' -e 'end repeat' -e 'end tell' 2>/dev/null || true
-	@killall GoNhanh 2>/dev/null || true
-	@sleep 0.5
-	@cp -r platforms/macos/build/Release/GoNhanh.app /Applications/
-	@open /Applications/GoNhanh.app
+install: ## Build core + macOS app, replace /Applications/GoNhanh.app, relaunch
+	@./scripts/build/core.sh
+	@./scripts/build/macos.sh
+	@./scripts/install/macos.sh
 
 dmg: build ## Create DMG installer
 	@./scripts/release/dmg-background.sh
