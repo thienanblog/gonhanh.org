@@ -148,34 +148,44 @@ private enum KeyCode {
     static let n7: CGKeyCode = 0x1A
     static let n8: CGKeyCode = 0x1C
     static let n9: CGKeyCode = 0x19
+
+    // Key sets read on every keystroke. Built once here instead of per call: a Set literal
+    // inside the event-tap callback allocates and hashes on each key press.
+
+    /// Standard break keys: space, tab, return, arrows, punctuation
+    static let standardBreak: Set<CGKeyCode> = [
+        space, tab, returnKey, enter, esc,
+        leftArrow, rightArrow, upArrow, downArrow,
+        dot, comma, slash, semicolon, quote,
+        lbracket, rbracket, backslash, minus,
+        equal, backquote,
+    ]
+
+    /// Number keys (break keys when shifted: !@#$%^&*())
+    static let numberKeys: Set<CGKeyCode> = [n0, n1, n2, n3, n4, n5, n6, n7, n8, n9]
+
+    /// Cursor-moving keys: with Cmd/Option/Shift they invalidate the composition (Issue #251)
+    static let navigation: Set<CGKeyCode> = [
+        leftArrow, rightArrow, upArrow, downArrow, home, end, pageUp, pageDown,
+    ]
+
+    /// Keys that still perform their normal action after the restore shortcut (Issue #157)
+    static let restorePassthrough: Set<CGKeyCode> = [
+        esc, tab, returnKey, enter,
+        leftArrow, rightArrow, upArrow, downArrow,
+        home, end, pageUp, pageDown,
+        forwardDelete,
+    ]
 }
 
 /// Check if key is a break key (space, punctuation, arrows, etc.)
 /// When shift=true, also treat number keys as break (they produce !@#$%^&*())
 private func isBreakKey(_ keyCode: CGKeyCode, shift: Bool) -> Bool {
-    // Standard break keys: space, tab, return, arrows, punctuation
-    let standardBreak: Set<CGKeyCode> = [
-        KeyCode.space, KeyCode.tab, KeyCode.returnKey, KeyCode.enter, KeyCode.esc,
-        KeyCode.leftArrow, KeyCode.rightArrow, KeyCode.upArrow, KeyCode.downArrow,
-        KeyCode.dot, KeyCode.comma, KeyCode.slash, KeyCode.semicolon, KeyCode.quote,
-        KeyCode.lbracket, KeyCode.rbracket, KeyCode.backslash, KeyCode.minus,
-        KeyCode.equal, KeyCode.backquote,
-    ]
-
-    if standardBreak.contains(keyCode) {
+    if KeyCode.standardBreak.contains(keyCode) {
         return true
     }
-
     // Shifted number keys produce symbols: !@#$%^&*()
-    if shift {
-        let numberKeys: Set<CGKeyCode> = [
-            KeyCode.n0, KeyCode.n1, KeyCode.n2, KeyCode.n3, KeyCode.n4,
-            KeyCode.n5, KeyCode.n6, KeyCode.n7, KeyCode.n8, KeyCode.n9,
-        ]
-        return numberKeys.contains(keyCode)
-    }
-
-    return false
+    return shift && KeyCode.numberKeys.contains(keyCode)
 }
 
 // MARK: - Injection Method
@@ -786,6 +796,17 @@ class RustBridge {
 /// reverse-DNS, locale-independent identifier — preferred over the window owner name.
 private let kAccessibilityKeyboardBundleId = "com.apple.inputmethod.AssistiveControl"
 
+/// Whether the Accessibility Keyboard host process is running at all.
+///
+/// A LaunchServices lookup (~2µs) that gates the window-list scans below. Those cost about
+/// 1-3ms each on the main thread, which also runs the event tap, and the mouse monitor runs
+/// one on every mouse down and up. The scans identify the panel through the same
+/// LaunchServices bundle id (NSRunningApplication), so when no such app is running they
+/// could never match and are skipped.
+private func isAccessibilityKeyboardRunning() -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: kAccessibilityKeyboardBundleId).isEmpty
+}
+
 /// Whether the given CGWindowList entry is owned by the Accessibility Keyboard panel.
 /// Resolves the window's owner PID to its bundle id (the stable identifier).
 private func windowIsAccessibilityKeyboard(_ w: [String: Any]) -> Bool {
@@ -801,6 +822,7 @@ private func windowIsAccessibilityKeyboard(_ w: [String: Any]) -> Bool {
 /// Screen Recording permission. Used to avoid clearing the composition buffer when the
 /// user taps a virtual key (issue #395).
 private func isClickOnAccessibilityKeyboard(_ nsPoint: CGPoint) -> Bool {
+    guard isAccessibilityKeyboardRunning() else { return false }
     // Convert NSEvent screen coordinates (origin bottom-left of the primary display, y up)
     // to CoreGraphics global coordinates (origin top-left of the primary display, y down).
     guard let primary = NSScreen.screens.first else { return false }
@@ -833,6 +855,7 @@ private func isClickOnAccessibilityKeyboard(_ nsPoint: CGPoint) -> Bool {
 /// enabled the manual "remote desktop" toggle. Detects the panel (not just the background
 /// process) by requiring a panel-sized on-screen window owned by AssistiveControl.
 private func isAccessibilityKeyboardVisible() -> Bool {
+    guard isAccessibilityKeyboardRunning() else { return false }
     guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
         as? [[String: Any]] else { return false }
 
@@ -955,6 +978,7 @@ class KeyboardHookManager {
     private var runLoopSource: CFRunLoopSource?
     private var mouseMonitor: Any? // NSEvent monitor for mouse clicks
     private var watchdogTimer: Timer? // periodically re-enables a silently-disabled tap
+    private var restartRetryTimer: Timer? // retries start() after restart() failed to recreate the tap
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isRunning = false
     private var requestedSessionTap = false // tap level start() asked for (watchdog compares it to wantsSessionTap)
@@ -975,12 +999,16 @@ class KeyboardHookManager {
         AppState.shared.sessionTapMode || isAccessibilityKeyboardVisible()
     }
 
-    func start() {
+    /// - Parameter silent: skip the Accessibility prompt and alert on failure (used by the
+    ///   restart retry, which runs every few seconds and must not stack dialogs).
+    func start(silent: Bool = false) {
         guard !isRunning else { return }
 
         guard AXIsProcessTrusted() else {
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            AXIsProcessTrustedWithOptions(opts)
+            if !silent {
+                let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                AXIsProcessTrustedWithOptions(opts)
+            }
             return
         }
 
@@ -1009,7 +1037,9 @@ class KeyboardHookManager {
         }
 
         guard let tap else {
-            showAccessibilityAlert()
+            if !silent {
+                showAccessibilityAlert()
+            }
             return
         }
 
@@ -1134,6 +1164,7 @@ class KeyboardHookManager {
     }
 
     func stop() {
+        cancelRestartRetry()
         secureInputState = SecureInputStateTracker()
         AppState.shared.setSecureInputBlocked(false)
         stopWorkspaceObservers()
@@ -1175,6 +1206,43 @@ class KeyboardHookManager {
     func restart() {
         stop()
         start()
+        // stop() already removed the tap and the watchdog. If start() could not create a new
+        // tap (e.g. Accessibility was revoked after a rebuild), nothing else would bring the
+        // keyboard hook back until the app is relaunched, so keep retrying quietly.
+        if !isRunning {
+            scheduleRestartRetry()
+        }
+    }
+
+    /// Retry start() with backoff: 2s, 4s, 8s ... capped at 60s, so a tap that keeps failing
+    /// to be created doesn't wake the app every couple of seconds forever.
+    private func scheduleRestartRetry(attempt: Int = 0) {
+        guard restartRetryTimer == nil else { return }
+        if attempt == 0 {
+            Log.info("restart: event tap not recreated, retrying")
+        }
+        let delay = min(SecureInputRefreshPolicy.watchdogInterval * pow(2, Double(min(attempt, 5))), 60)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.restartRetryTimer = nil
+            // AXIsProcessTrusted() without the prompt option never shows UI.
+            if !self.isRunning, AXIsProcessTrusted() {
+                self.start(silent: true)
+            }
+            if self.isRunning {
+                Log.info("restart: event tap recreated")
+            } else {
+                self.scheduleRestartRetry(attempt: attempt + 1)
+            }
+        }
+        timer.tolerance = SecureInputRefreshPolicy.watchdogTolerance
+        RunLoop.main.add(timer, forMode: .common)
+        restartRetryTimer = timer
+    }
+
+    private func cancelRestartRetry() {
+        restartRetryTimer?.invalidate()
+        restartRetryTimer = nil
     }
 
     private func showAccessibilityAlert() {
@@ -1256,9 +1324,73 @@ private var wasControlPressed = false
 
 // MARK: - Word Restore Support
 
-/// Get word that we're about to backspace into
-/// Returns the word only if cursor is right after a space/punctuation that follows a word
-/// This ensures we only restore when actually entering a word, not when deleting within a word
+/// Picks the word to restore into the engine when Backspace is about to delete the separator
+/// after it (e.g. "chào |" + Backspace). Pure, so it is unit-tested without AX.
+enum WordRestore {
+    /// UTF-16 units read before the cursor. Far longer than any Vietnamese syllable plus its
+    /// separator, and small enough that the AX read stays cheap in huge documents.
+    static let lookbehindUTF16 = 64
+
+    /// - Parameters:
+    ///   - text: the text immediately before the cursor (only its tail matters).
+    ///   - truncated: true when `text` does not start at the beginning of the field, so a
+    ///     word reaching its first character may be cut off and must not be restored.
+    /// - Returns: the word when the last character is the only space/punctuation between
+    ///   the cursor and a word that looks Vietnamese (diacritics or plain ASCII letters).
+    static func word(beforeCursor text: String, truncated: Bool) -> String? {
+        let chars = Array(text)
+        // Only restore if we're about to delete the LAST space/punctuation before a word,
+        // i.e. the cursor is at "word |" (about to delete the space and enter "word").
+        guard let last = chars.last, isSeparator(last) else { return nil }
+        let wordEnd = chars.count - 1
+        // More than one space/punctuation between cursor and word: don't restore yet.
+        guard wordEnd > 0, !isSeparator(chars[wordEnd - 1]) else { return nil }
+
+        var wordStart = wordEnd
+        while wordStart > 0, !isSeparator(chars[wordStart - 1]) {
+            wordStart -= 1
+        }
+        // The word may continue before the text we were given.
+        if truncated, wordStart == 0 {
+            return nil
+        }
+
+        let word = String(chars[wordStart ..< wordEnd])
+        // Only return if it looks like Vietnamese (has diacritics or is pure ASCII letters)
+        let hasVietnameseDiacritics = word.contains { c in
+            c.unicodeScalars.first.map { $0.value >= 0x00C0 && $0.value <= 0x1EF9 } ?? false
+        }
+        let isPureASCIILetters = word.allSatisfy { $0.isLetter && $0.isASCII }
+        return (hasVietnameseDiacritics || isPureASCIILetters) ? word : nil
+    }
+
+    /// The text before an AX cursor offset. AX reports offsets in UTF-16 units, so the cut is
+    /// made in UTF-16; nil when the offset is past the end or splits a surrogate pair.
+    static func textBeforeCursor(_ text: String, utf16Offset: Int) -> String? {
+        let utf16 = text.utf16
+        guard utf16Offset >= 0, utf16Offset <= utf16.count else { return nil }
+        return String(utf16.prefix(utf16Offset))
+    }
+
+    private static func isSeparator(_ c: Character) -> Bool {
+        c.isWhitespace || c.isPunctuation
+    }
+}
+
+/// PIDs whose focused text element rejected kAXStringForRangeParameterizedAttribute.
+/// They go straight to the full-value read instead of paying a failed AX round trip on
+/// every Backspace. Touched only from the event-tap callback (main run loop).
+private var pidsWithoutRangedTextRead = Set<pid_t>()
+
+/// Get the word we're about to backspace into, or nil.
+///
+/// Runs on every Backspace the engine passes through (most of them), inside the event-tap
+/// callback, so it must stay cheap. It reads only a short window before the cursor via
+/// kAXStringForRangeParameterizedAttribute; copying the whole kAXValue costs O(document)
+/// per keystroke in long documents. Apps that don't support ranged reads fall back to the
+/// full value. AX reports the cursor as a UTF-16 offset, so the text before it is cut by
+/// UTF-16 too: indexing Characters with it shifts after an emoji, CRLF or decomposed
+/// letter and could restore the wrong word, corrupting the next replacement.
 private func getWordToRestoreOnBackspace() -> String? {
     let systemWide = axSystemWideBounded()
     var focused: CFTypeRef?
@@ -1268,68 +1400,56 @@ private func getWordToRestoreOnBackspace() -> String? {
     // swiftlint:disable:next force_cast
     let axEl = el as! AXUIElement
 
-    // Get text value
-    var textValue: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString, &textValue) == .success,
-          let text = textValue as? String, !text.isEmpty else { return nil }
-
-    // Get selected text range (cursor position)
+    // Selected text range (cursor position, UTF-16)
     var rangeValue: CFTypeRef?
     guard AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success,
-          let rv = rangeValue else { return nil }
+          let rv = rangeValue,
+          CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
     // swiftlint:disable:next force_cast
     let rangeRef = rv as! AXValue
-
-    // Extract range from AXValue
     var range = CFRange(location: 0, length: 0)
     guard AXValueGetValue(rangeRef, .cfRange, &range) else { return nil }
 
-    let cursorPos = range.location
-    guard cursorPos > 0 else { return nil }
+    // With a selection, Backspace deletes the selection rather than the separator.
+    let cursor = range.location
+    guard cursor > 0, range.length == 0 else { return nil }
 
-    let textChars = Array(text)
-    guard cursorPos <= textChars.count else { return nil }
-
-    let charBeforeCursor = textChars[cursorPos - 1]
-
-    // Only restore if we're about to delete the LAST space/punctuation before a word
-    // i.e., cursor is at: "word |" (about to delete space and enter "word")
-    guard charBeforeCursor.isWhitespace || charBeforeCursor.isPunctuation else { return nil }
-
-    // Check if there's a word before this space (not more spaces)
-    var wordEnd = cursorPos - 1
-
-    // Skip all trailing spaces/punctuation to find the word
-    while wordEnd > 0, textChars[wordEnd - 1].isWhitespace || textChars[wordEnd - 1].isPunctuation {
-        wordEnd -= 1
+    var pid: pid_t = 0
+    let hasPid = AXUIElementGetPid(axEl, &pid) == .success
+    if !(hasPid && pidsWithoutRangedTextRead.contains(pid)) {
+        // Fast path: read only the window before the cursor.
+        let start = max(0, cursor - WordRestore.lookbehindUTF16)
+        var window = CFRange(location: start, length: cursor - start)
+        if let windowRange = AXValueCreate(.cfRange, &window) {
+            var windowText: CFTypeRef?
+            let err = AXUIElementCopyParameterizedAttributeValue(
+                axEl, kAXStringForRangeParameterizedAttribute as CFString, windowRange, &windowText
+            )
+            switch err {
+            case .success:
+                if let text = windowText as? String, !text.isEmpty {
+                    return WordRestore.word(beforeCursor: text, truncated: start > 0)
+                }
+            case .cannotComplete:
+                // Messaging timeout: the app is busy. A full-value read would only stall the
+                // tap callback for another timeout, so give up on this Backspace.
+                return nil
+            case .attributeUnsupported, .parameterizedAttributeUnsupported:
+                if hasPid {
+                    pidsWithoutRangedTextRead.insert(pid)
+                }
+            default:
+                break
+            }
+        }
     }
 
-    guard wordEnd > 0 else { return nil }
-
-    // But we only want to restore when deleting THE LAST space before the word
-    // If there are more spaces between cursor and word, don't restore yet
-    if wordEnd < cursorPos - 1 {
-        return nil
-    } // More than one space/punct between cursor and word
-
-    // Find start of word
-    var wordStart = wordEnd
-    while wordStart > 0, !textChars[wordStart - 1].isWhitespace, !textChars[wordStart - 1].isPunctuation {
-        wordStart -= 1
-    }
-
-    // Extract word
-    let word = String(textChars[wordStart ..< wordEnd])
-    guard !word.isEmpty else { return nil }
-
-    // Only return if it looks like Vietnamese (has diacritics or is pure ASCII letters)
-    let hasVietnameseDiacritics = word.contains { c in
-        let scalars = c.unicodeScalars
-        return scalars.first.map { $0.value >= 0x00C0 && $0.value <= 0x1EF9 } ?? false
-    }
-    let isPureASCIILetters = word.allSatisfy { $0.isLetter && $0.isASCII }
-
-    return (hasVietnameseDiacritics || isPureASCIILetters) ? word : nil
+    // Fallback: full value, cut at the cursor in UTF-16.
+    var textValue: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString, &textValue) == .success,
+          let text = textValue as? String,
+          let prefix = WordRestore.textBeforeCursor(text, utf16Offset: cursor) else { return nil }
+    return WordRestore.word(beforeCursor: prefix, truncated: false)
 }
 
 private extension CGEvent {
@@ -1586,12 +1706,13 @@ private func keyboardCallback(
     // then clear buffer. Engine sets pending_capitalize when it sees Enter key.
     // Also handle auto-restore and shortcut results (same as ESC handling)
     if keyCode == 0x24 || keyCode == 0x4C { // Return (0x24) or Enter/Numpad (0x4C)
+        // detectMethod() first: isDiscordFocusedContext() reads the bundle id it caches.
+        let (method, delays) = detectMethod()
+
         if isDiscordFocusedContext() {
             RustBridge.clearBufferAll()
             return Unmanaged.passUnretained(event)
         }
-
-        let (method, delays) = detectMethod()
 
         if let (bs, chars, keyConsumed) = RustBridge.processKey(keyCode: keyCode, caps: caps, ctrl: bypassIME, shift: shift) {
             Log.key(keyCode, "enter: bs=\(bs) chars='\(String(chars))' consumed=\(keyConsumed)")
@@ -1616,13 +1737,7 @@ private func keyboardCallback(
         // Only pass through special keys that should still function after restore
         // (ESC closes dialogs, Tab moves focus, Enter submits, etc.)
         // For letter/number keys with modifiers (Shift-Z, Option-Z), consume the event
-        let specialPassthroughKeys: Set<CGKeyCode> = [
-            KeyCode.esc, KeyCode.tab, KeyCode.returnKey, KeyCode.enter,
-            KeyCode.leftArrow, KeyCode.rightArrow, KeyCode.upArrow, KeyCode.downArrow,
-            KeyCode.home, KeyCode.end, KeyCode.pageUp, KeyCode.pageDown,
-            KeyCode.forwardDelete,
-        ]
-        if specialPassthroughKeys.contains(keyCode) {
+        if KeyCode.restorePassthrough.contains(keyCode) {
             return Unmanaged.passUnretained(event) // Pass through special keys
         }
         return nil // Consume letter/number keys with modifiers
@@ -1641,18 +1756,8 @@ private func keyboardCallback(
     // Cmd+Arrow: move by line, Option+Arrow: move by word, Shift+Arrow: select
     // Also: Shift+Home/End/PageUp/PageDown for text selection (Issue #251)
     // All of these invalidate the current composition context
-    let navigationKeys: Set<UInt16> = [
-        UInt16(KeyCode.leftArrow), // 0x7B
-        UInt16(KeyCode.rightArrow), // 0x7C
-        UInt16(KeyCode.upArrow), // 0x7E
-        UInt16(KeyCode.downArrow), // 0x7D
-        UInt16(KeyCode.home), // 0x73
-        UInt16(KeyCode.end), // 0x77
-        UInt16(KeyCode.pageUp), // 0x74
-        UInt16(KeyCode.pageDown), // 0x79
-    ]
     let hasModifier = flags.contains(.maskCommand) || flags.contains(.maskAlternate) || flags.contains(.maskShift)
-    if navigationKeys.contains(keyCode), hasModifier {
+    if KeyCode.navigation.contains(keyCode), hasModifier {
         RustBridge.clearBuffer()
         return Unmanaged.passUnretained(event)
     }
@@ -1686,7 +1791,10 @@ private func keyboardCallback(
         // Engine returned none - try to restore word from screen
         // This handles: "chào " + backspace to delete space and enter word
         // Skip restore if just clicked (user may be deleting a selection)
-        if !skipWordRestoreAfterClick, let word = getWordToRestoreOnBackspace() {
+        // Skip while Backspace auto-repeats: the next repeat deletes into any restored word
+        // anyway, and holding the key would otherwise run this AX lookup ~30 times a second.
+        let isAutoRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        if !skipWordRestoreAfterClick, !isAutoRepeat, let word = getWordToRestoreOnBackspace() {
             RustBridge.restoreWord(word)
         }
         // Don't reset skipWordRestoreAfterClick here - keep skipping until a real letter is typed
@@ -1758,10 +1866,18 @@ private func keyboardCallback(
 /// Uses time-based TTL (200ms) + app switch invalidation for safety
 /// PERFORMANCE: Uses CFAbsoluteTimeGetCurrent() instead of Date() for faster timestamp
 private enum DetectionCache {
-    static var result: (method: InjectionMethod, delays: (UInt32, UInt32, UInt32))?
+    /// `focusedIsDiscord` comes from the same AX query, so it shares the TTL.
+    static var result: (method: InjectionMethod, delays: (UInt32, UInt32, UInt32), focusedIsDiscord: Bool)?
     static var timestamp: CFAbsoluteTime = 0
     static var lastLoggedKey: String = "" // Only log when method+app changes
     static let ttl: CFAbsoluteTime = 0.2 // 200ms
+
+    /// Whether the focused element's app is Discord, per the last detectMethod().
+    /// False once the cache expired, so callers must run detectMethod() first.
+    static var cachedFocusedIsDiscord: Bool {
+        guard let cached = result, CFAbsoluteTimeGetCurrent() - timestamp < ttl else { return false }
+        return cached.focusedIsDiscord
+    }
 
     /// Snapshot of per-app profile for current app, set on app switch to avoid
     /// accessing @Published dictionary from keystroke hot path (thread safety)
@@ -1805,13 +1921,18 @@ private enum DetectionCache {
         return (cached.method, cached.delays)
     }
 
-    static func set(_ method: InjectionMethod, _ delays: (UInt32, UInt32, UInt32), logKey: String) {
-        result = (method, delays)
+    static func set(_ method: InjectionMethod, _ delays: (UInt32, UInt32, UInt32), focusedIsDiscord: Bool,
+                    logKey: @autoclosure () -> String)
+    {
+        result = (method, delays, focusedIsDiscord)
         timestamp = CFAbsoluteTimeGetCurrent()
-        // Only log when method+app combination changes
-        if logKey != lastLoggedKey {
-            lastLoggedKey = logKey
-            Log.method(logKey)
+        // Only log when method+app combination changes. The key is built only while logging
+        // is on, so a cache miss with logging off does no string formatting.
+        guard Log.isEnabled else { return }
+        let key = logKey()
+        if key != lastLoggedKey {
+            lastLoggedKey = key
+            Log.method(key)
         }
     }
 
@@ -1839,151 +1960,25 @@ private func isDiscordApp(_ app: NSRunningApplication?) -> Bool {
     return bundleId.contains("discord") || name.contains("discord")
 }
 
+/// Whether Discord (frontmost, or owning the focused element) receives this Enter.
+///
+/// Reuses the focused-element result of detectMethod()'s cached AX query instead of a
+/// second, uncached AX round trip to the focused app on every Enter. Call detectMethod() first.
 private func isDiscordFocusedContext() -> Bool {
-    if isDiscordApp(NSWorkspace.shared.frontmostApplication) {
-        return true
-    }
-
-    let systemWide = axSystemWideBounded()
-    var focused: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-          let focused
-    else {
-        return false
-    }
-
-    let axEl = focused as! AXUIElement
-    var pid: pid_t = 0
-    guard AXUIElementGetPid(axEl, &pid) == .success,
-          let app = NSRunningApplication(processIdentifier: pid)
-    else {
-        return false
-    }
-
-    return isDiscordApp(app)
+    isDiscordApp(NSWorkspace.shared.frontmostApplication) || DetectionCache.cachedFocusedIsDiscord
 }
 
-private func detectMethod() -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
-    // Fast path: return cached result if valid
-    if let cached = DetectionCache.get() {
-        return cached
-    }
-
-    // Slow path: query AX for focused element
-    let systemWide = axSystemWideBounded()
-    var focused: CFTypeRef?
-    var role: String?
-    var bundleId: String?
-
-    // Time the AX IPC: if a focused app is slow to answer, this is what stalls
-    // the event-tap callback. The bounded messaging timeout caps each call, so a
-    // slow app shows up here as ~0.1s rather than a multi-second hang.
-    let axStart = Log.isEnabled ? CFAbsoluteTimeGetCurrent() : 0
-    if AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-       let el = focused
-    {
-        let axEl = el as! AXUIElement
-
-        // Get role
-        var roleVal: CFTypeRef?
-        AXUIElementCopyAttributeValue(axEl, kAXRoleAttribute as CFString, &roleVal)
-        role = roleVal as? String
-
-        // Get owning app's bundle ID (works for Spotlight overlay)
-        var pid: pid_t = 0
-        if AXUIElementGetPid(axEl, &pid) == .success {
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                bundleId = app.bundleIdentifier
-            }
-        }
-    }
-    if Log.isEnabled {
-        let axMs = (CFAbsoluteTimeGetCurrent() - axStart) * 1000
-        if axMs > 30 {
-            Log.info("AX detect slow: \(Int(axMs))ms app=\(bundleId ?? "nil")")
-        }
-    }
-
-    // Fallback to frontmost app if we couldn't get bundle from focused element
-    if bundleId == nil {
-        bundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-    }
-
-    guard let bundleId else { return (.fast, (200, 800, 500)) }
-
-    /// Helper to cache and return result (only logs when method+app changes)
-    func cached(_ m: InjectionMethod, _ d: (UInt32, UInt32, UInt32), _ methodName: String) -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
-        // Store base detection result (before overrides) for UI hint
-        DetectionCache.setDetectedDefault(for: bundleId, value: (method: "\(m)", delays: d))
-
-        // Apply per-app profile overrides from snapshot (set on app switch, thread-safe)
-        if let profile = DetectionCache.activeProfile {
-            var finalMethod = m
-            let finalDelays = DelayPreset(rawValue: profile.delayPreset)?.delays ?? d
-
-            // Injection method override
-            if profile.injectionOverride >= 0, let inject = InjectionOverride(rawValue: profile.injectionOverride) {
-                switch inject {
-                case .fast: finalMethod = .fast
-                case .slow: finalMethod = .slow
-                case .charByChar: finalMethod = .charByChar
-                case .selection: finalMethod = .selection
-                case .emptyCharPrefix: finalMethod = .emptyCharPrefix
-                case .auto: break
-                }
-            }
-
-            let logKey = "override:\(methodName) [\(bundleId)] m=\(finalMethod) d=\(finalDelays)"
-            DetectionCache.set(finalMethod, finalDelays, logKey: logKey)
-            return (finalMethod, finalDelays)
-        }
-        let logKey = "\(methodName) [\(bundleId)] role=\(role ?? "nil")"
-        DetectionCache.set(m, d, logKey: logKey); return (m, d)
-    }
-
-    // iPhone Mirroring (ScreenContinuity) - pass through all keys
-    if bundleId == "com.apple.ScreenContinuity" {
-        return cached(.passthrough, (0, 0, 0), "pass:iphone")
-    }
-
-    // Remote desktop clients - pass through all keys
-    // These apps forward physical keystrokes to the remote machine over the network.
-    // GoNhanh's synthetic injections (backspace + Vietnamese char) are NOT forwarded,
-    // causing garbled input on the remote. Passthrough lets raw keys reach the remote
-    // intact; Vietnamese composition must happen on the remote machine itself.
-    let remoteDesktopApps: Set = [
+/// Bundle id sets used by detectMethod(). Built once instead of on every cache miss.
+private enum KnownApps {
+    /// Remote desktop clients: pass all keys through (see detectMethod)
+    static let remoteDesktop: Set<String> = [
         "com.carriez.rustdesk", // RustDesk
         "com.philandro.anydesk", // AnyDesk
         "com.teamviewer.TeamViewer", // TeamViewer
     ]
-    if remoteDesktopApps.contains(bundleId) {
-        return cached(.passthrough, (0, 0, 0), "pass:remote")
-    }
 
-    // Selection method for autocomplete UI elements
-    if role == "AXComboBox" {
-        return cached(.selection, (0, 0, 0), "sel:combo")
-    }
-    if role == "AXSearchField" {
-        return cached(.selection, (0, 0, 0), "sel:search")
-    }
-
-    // Spotlight - use AX API direct manipulation (macOS 13+)
-    if SpecialPanelAppDetector.isSpotlight(bundleId) || bundleId == "com.apple.systemuiserver" {
-        return cached(.axDirect, (0, 0, 0), "ax:spotlight")
-    }
-
-    // Safari: address bar uses emptyCharPrefix, content areas (Google Docs) use charByChar
-    // Must be checked BEFORE general browsers array since Safari needs special content handling
-    if bundleId == "com.apple.Safari" || bundleId == "com.apple.SafariTechnologyPreview" {
-        if role == "AXTextField" {
-            return cached(.emptyCharPrefix, (3000, 8000, 3000), "emptyChar:safari")
-        }
-        return cached(.charByChar, (3000, 8000, 3000), "char:safari")
-    }
-
-    // Browser address bars (AXTextField/AXTextArea/AXWindow): emptyCharPrefix to break autocomplete
-    let browsers = [
+    /// Browsers: emptyCharPrefix to break address-bar autocomplete
+    static let browsers: Set<String> = [
         // The Browser Company
         "company.thebrowser.Browser", "company.thebrowser.Arc", "company.thebrowser.dia",
         // Firefox-based
@@ -2023,9 +2018,143 @@ private func detectMethod() -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
         "com.duckduckgo.macos.browser", // DuckDuckGo
         "com.openai.atlas", // ChatGPT Atlas
     ]
+
+    /// Code editors & terminals: slow method with higher delays (Monaco/Electron)
+    static let codeEditorsAndTerminals: Set<String> = [
+        // VSCode-based IDEs
+        "com.microsoft.VSCode", "com.google.antigravity-ide", "com.todesktop.cursor",
+        "com.visualstudio.code.oss", "com.vscodium",
+        // Terminals
+        "dev.warp.Warp-Stable", "com.mitchellh.ghostty", "net.kovidgoyal.kitty",
+        "com.apple.Terminal", "com.googlecode.iterm2", "io.alacritty",
+        "com.github.wez.wezterm", "co.zeit.hyper", "org.tabby",
+        "com.raphaelamorim.rio", "com.termius-dmg.mac",
+        // Other code editors
+        "dev.zed.Zed", "com.sublimetext.4", "com.sublimetext.3", "com.panic.Nova",
+    ]
+}
+
+private func detectMethod() -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
+    // Fast path: return cached result if valid
+    if let cached = DetectionCache.get() {
+        return cached
+    }
+
+    // Slow path: query AX for focused element
+    let systemWide = axSystemWideBounded()
+    var focused: CFTypeRef?
+    var role: String?
+    var bundleId: String?
+    var focusedIsDiscord = false
+
+    // Time the AX IPC: if a focused app is slow to answer, this is what stalls
+    // the event-tap callback. The bounded messaging timeout caps each call, so a
+    // slow app shows up here as ~0.1s rather than a multi-second hang.
+    let axStart = Log.isEnabled ? CFAbsoluteTimeGetCurrent() : 0
+    if AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+       let el = focused
+    {
+        let axEl = el as! AXUIElement
+
+        // Get role
+        var roleVal: CFTypeRef?
+        AXUIElementCopyAttributeValue(axEl, kAXRoleAttribute as CFString, &roleVal)
+        role = roleVal as? String
+
+        // Get owning app's bundle ID (works for Spotlight overlay)
+        var pid: pid_t = 0
+        if AXUIElementGetPid(axEl, &pid) == .success {
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                bundleId = app.bundleIdentifier
+                focusedIsDiscord = isDiscordApp(app)
+            }
+        }
+    }
+    if Log.isEnabled {
+        let axMs = (CFAbsoluteTimeGetCurrent() - axStart) * 1000
+        if axMs > 30 {
+            Log.info("AX detect slow: \(Int(axMs))ms app=\(bundleId ?? "nil")")
+        }
+    }
+
+    // Fallback to frontmost app if we couldn't get bundle from focused element
+    if bundleId == nil {
+        bundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    }
+
+    guard let bundleId else { return (.fast, (200, 800, 500)) }
+
+    /// Helper to cache and return result (only logs when method+app changes)
+    func cached(_ m: InjectionMethod, _ d: (UInt32, UInt32, UInt32), _ methodName: String) -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
+        // Store base detection result (before overrides) for UI hint
+        DetectionCache.setDetectedDefault(for: bundleId, value: (method: "\(m)", delays: d))
+
+        // Apply per-app profile overrides from snapshot (set on app switch, thread-safe)
+        if let profile = DetectionCache.activeProfile {
+            var finalMethod = m
+            let finalDelays = DelayPreset(rawValue: profile.delayPreset)?.delays ?? d
+
+            // Injection method override
+            if profile.injectionOverride >= 0, let inject = InjectionOverride(rawValue: profile.injectionOverride) {
+                switch inject {
+                case .fast: finalMethod = .fast
+                case .slow: finalMethod = .slow
+                case .charByChar: finalMethod = .charByChar
+                case .selection: finalMethod = .selection
+                case .emptyCharPrefix: finalMethod = .emptyCharPrefix
+                case .auto: break
+                }
+            }
+
+            DetectionCache.set(finalMethod, finalDelays, focusedIsDiscord: focusedIsDiscord,
+                               logKey: "override:\(methodName) [\(bundleId)] m=\(finalMethod) d=\(finalDelays)")
+            return (finalMethod, finalDelays)
+        }
+        DetectionCache.set(m, d, focusedIsDiscord: focusedIsDiscord,
+                           logKey: "\(methodName) [\(bundleId)] role=\(role ?? "nil")")
+        return (m, d)
+    }
+
+    // iPhone Mirroring (ScreenContinuity) - pass through all keys
+    if bundleId == "com.apple.ScreenContinuity" {
+        return cached(.passthrough, (0, 0, 0), "pass:iphone")
+    }
+
+    // Remote desktop clients - pass through all keys
+    // These apps forward physical keystrokes to the remote machine over the network.
+    // GoNhanh's synthetic injections (backspace + Vietnamese char) are NOT forwarded,
+    // causing garbled input on the remote. Passthrough lets raw keys reach the remote
+    // intact; Vietnamese composition must happen on the remote machine itself.
+    if KnownApps.remoteDesktop.contains(bundleId) {
+        return cached(.passthrough, (0, 0, 0), "pass:remote")
+    }
+
+    // Selection method for autocomplete UI elements
+    if role == "AXComboBox" {
+        return cached(.selection, (0, 0, 0), "sel:combo")
+    }
+    if role == "AXSearchField" {
+        return cached(.selection, (0, 0, 0), "sel:search")
+    }
+
+    // Spotlight - use AX API direct manipulation (macOS 13+)
+    if SpecialPanelAppDetector.isSpotlight(bundleId) || bundleId == "com.apple.systemuiserver" {
+        return cached(.axDirect, (0, 0, 0), "ax:spotlight")
+    }
+
+    // Safari: address bar uses emptyCharPrefix, content areas (Google Docs) use charByChar
+    // Must be checked BEFORE general browsers array since Safari needs special content handling
+    if bundleId == "com.apple.Safari" || bundleId == "com.apple.SafariTechnologyPreview" {
+        if role == "AXTextField" {
+            return cached(.emptyCharPrefix, (3000, 8000, 3000), "emptyChar:safari")
+        }
+        return cached(.charByChar, (3000, 8000, 3000), "char:safari")
+    }
+
+    // Browser address bars (AXTextField/AXTextArea/AXWindow): emptyCharPrefix to break autocomplete
     // All browser contexts use emptyCharPrefix to break autocomplete/suggestion highlights
     // Medium delays (3ms/8ms/3ms) to handle web apps with popup interception (e.g. Telegram Web)
-    if browsers.contains(bundleId) {
+    if KnownApps.browsers.contains(bundleId) {
         return cached(.emptyCharPrefix, (3000, 8000, 3000), "emptyChar:browser")
     }
     if role == "AXTextField", bundleId.hasPrefix("com.jetbrains") {
@@ -2053,19 +2182,7 @@ private func detectMethod() -> (InjectionMethod, (UInt32, UInt32, UInt32)) {
 
     // Code editors & terminals - higher delays for Monaco/Electron-based apps
     // Includes: VSCode-based (VSCode, Cursor, Antigravity), terminals (Warp, Ghostty, Kitty, etc.)
-    let codeApps = [
-        // VSCode-based IDEs
-        "com.microsoft.VSCode", "com.google.antigravity-ide", "com.todesktop.cursor",
-        "com.visualstudio.code.oss", "com.vscodium",
-        // Terminals
-        "dev.warp.Warp-Stable", "com.mitchellh.ghostty", "net.kovidgoyal.kitty",
-        "com.apple.Terminal", "com.googlecode.iterm2", "io.alacritty",
-        "com.github.wez.wezterm", "co.zeit.hyper", "org.tabby",
-        "com.raphaelamorim.rio", "com.termius-dmg.mac",
-        // Other code editors
-        "dev.zed.Zed", "com.sublimetext.4", "com.sublimetext.3", "com.panic.Nova",
-    ]
-    if codeApps.contains(bundleId) {
+    if KnownApps.codeEditorsAndTerminals.contains(bundleId) {
         return cached(.slow, (8000, 25000, 8000), "slow:code")
     }
 
